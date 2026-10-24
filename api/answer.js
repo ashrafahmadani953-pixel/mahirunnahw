@@ -1,21 +1,23 @@
 // ماهر النحو — سوال جواب AI proxy (Vercel serverless function)
-// Deployed ONCE into the repo as api/answer.js. Holds the Gemini API key
+// Deployed into the repo as api/answer.js. Holds the Gemini API key
 // server-side (Vercel env var GEMINI_API_KEY) so the key never appears in
 // the page. Verifies the caller's Firebase ID token and that the caller is
 // an ACTIVE user in the Firestore allowlist before spending any quota.
 //
-// Correction (2026-10-24): gemini-2.5-flash is closed to NEW AI Studio keys
-// and returns 404 for them (proven live: the site showed gemini_404).
-// The proxy now walks a model list per request and uses the first model
-// Google serves to this key — a future model retirement degrades to the
-// next entry instead of killing the service.
+// SELF-HEALING MODELS (2026-10-24): no model name is trusted for long —
+// Google retires model ids and closes them to new keys (gemini-2.5-flash
+// began returning 404 for this key, and per-model free quotas run out
+// with 429). So the proxy ASKS GOOGLE which models this key may use
+// (ListModels), ranks them, caches the list for 30 minutes, and walks it
+// per request: 404 / 429 / 5xx all move on to the next model. If the
+// ListModels call itself fails, the hardcoded fallback lists below apply.
 //
 // Env vars required in Vercel project settings:
 //   GEMINI_API_KEY   — the AI Studio key (secret)
 //   FIREBASE_API_KEY — the site's public Firebase web apiKey (already public)
 
-const ANSWER_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash"];
-const TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"];
+const FALLBACK_ANSWER_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash"];
+const FALLBACK_TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"];
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || "AIzaSyBSIsS5uk6wEu3nd7rimi8Pwu3Naw_nL2Q";
 
 const SYSTEM_NAHW = `You are the answer engine inside «ماہر النحو», a website devoted EXCLUSIVELY to Arabic grammar (فن النحو). Rules:
@@ -49,9 +51,52 @@ async function verifyCaller(idToken) {
   return active ? email : null;
 }
 
-// POST generateContent to the first model in `models` that Google serves to
-// this key. A 404 means "model not open to this key" — walk to the next one.
-// Any other HTTP error aborts immediately with its status in the message.
+// ---- Self-healing model discovery ----------------------------------------
+// Rank a text model: newest Gemini version first; Flash before Pro (speed
+// and free quota); full Flash before Flash-Lite (quality); stable before
+// preview. Gemma counts only as a last resort.
+function textModelScore(name) {
+  const m = name.match(/gemini-(\d+(?:\.\d+)?)/);
+  let s = (m ? parseFloat(m[1]) : 0) * 1000;
+  if (name.includes("flash")) s += 100;
+  else if (name.includes("pro")) s += 50;
+  if (name.includes("lite")) s -= 10;
+  if (name.includes("preview")) s -= 20;
+  if (name.startsWith("gemma")) s -= 5000;
+  return s;
+}
+
+let modelCache = { at: 0, text: null, tts: null };
+
+async function discoverModels() {
+  const now = Date.now();
+  if (modelCache.text && now - modelCache.at < 30 * 60 * 1000) return modelCache;
+  const key = process.env.GEMINI_API_KEY;
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${key}`);
+    if (!r.ok) throw new Error("list_" + r.status);
+    const data = await r.json();
+    const usable = (data.models || [])
+      .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+      .map(m => String(m.name || "").replace(/^models\//, ""))
+      .filter(Boolean);
+    const text = usable
+      .filter(n => !n.includes("tts") && !n.includes("image") && !n.includes("audio") &&
+                   !n.includes("live") && !n.includes("embedding") && !n.includes("robotics") &&
+                   !n.includes("computer-use") && !n.includes("aqa"))
+      .sort((a, b) => textModelScore(b) - textModelScore(a));
+    const tts = usable
+      .filter(n => n.includes("tts"))
+      .sort((a, b) => textModelScore(b) - textModelScore(a));
+    if (text.length) modelCache = { at: now, text, tts: tts.length ? tts : FALLBACK_TTS_MODELS };
+  } catch (e) { /* keep whatever we have; fallbacks apply below */ }
+  if (!modelCache.text) modelCache = { at: now, text: FALLBACK_ANSWER_MODELS, tts: FALLBACK_TTS_MODELS };
+  return modelCache;
+}
+
+// POST generateContent walking the model list: 404 (model closed to this
+// key), 429 (this model's free quota used up) and 5xx (transient trouble)
+// all move on to the next model. Any other HTTP error aborts with its code.
 async function geminiCall(models, body) {
   const key = process.env.GEMINI_API_KEY;
   let lastErr = null;
@@ -62,7 +107,7 @@ async function geminiCall(models, body) {
       body: JSON.stringify(body),
     });
     if (r.ok) return { model, data: await r.json() };
-    if (r.status === 404) { lastErr = new Error("gemini_404"); continue; }
+    if (r.status === 404 || r.status === 429 || r.status >= 500) { lastErr = new Error("gemini_" + r.status); continue; }
     throw new Error("gemini_" + r.status);
   }
   throw lastErr || new Error("gemini_404");
@@ -75,7 +120,8 @@ async function geminiAnswer(question, langName, contextText, kind) {
     userText += `\n\nOUTPUT FORMAT (mandatory): reply with ONLY a JSON object, no markdown fences, no extra text:
 {"passage": "<the complete Arabic passage/ayah exactly as supplied>", "translation": "<a faithful translation of the passage into ${langName}>", "mujmal": "<concise sentence-level tarkeeb (مجمل) in ${langName}, Arabic terms in Arabic script>", "mufassal": "<full word-by-word tarkeeb (مفصل): every word — its kind, i'rab or bina', its function; for every مبنی word state مبنی اصل or مبنی غیر اصل with the reason; list all valid ihtimalat where they exist — in ${langName}, Arabic terms in Arabic script>"}`;
   }
-  const { data } = await geminiCall(ANSWER_MODELS, {
+  const models = (await discoverModels()).text;
+  const { data } = await geminiCall(models, {
     systemInstruction: { parts: [{ text: SYSTEM_NAHW }] },
     contents: [{ role: "user", parts: [{ text: userText }] }],
     generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
@@ -104,7 +150,8 @@ function pcmToWavBase64(pcmBase64, sampleRate = 24000) {
 }
 
 async function geminiSpeak(text, voiceName) {
-  const { data } = await geminiCall(TTS_MODELS, {
+  const models = (await discoverModels()).tts;
+  const { data } = await geminiCall(models, {
     contents: [{ role: "user", parts: [{ text }] }],
     generationConfig: {
       responseModalities: ["AUDIO"],
