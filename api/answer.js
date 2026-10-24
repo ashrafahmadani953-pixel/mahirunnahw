@@ -29,14 +29,14 @@ async function verifyCaller(idToken) {
   const data = await r.json();
   const email = data.users && data.users[0] && data.users[0].email;
   if (!email) return null;
+  if (email.toLowerCase() === "ashrafahmadani953@gmail.com") return email;
   const projectId = "mahirunnahw";
   const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${encodeURIComponent(email.toLowerCase())}`;
   const d = await fetch(docUrl, { headers: { Authorization: `Bearer ${idToken}` } });
   if (!d.ok) return null;
   const doc = await d.json();
   const active = doc.fields && doc.fields.active && doc.fields.active.booleanValue === true;
-  const isAdmin = email.toLowerCase() === "ashrafahmadani953@gmail.com";
-  return active || isAdmin ? email : null;
+  return active ? email : null;
 }
 
 async function geminiAnswer(question, langName, contextText, kind) {
