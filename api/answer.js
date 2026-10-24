@@ -4,12 +4,18 @@
 // the page. Verifies the caller's Firebase ID token and that the caller is
 // an ACTIVE user in the Firestore allowlist before spending any quota.
 //
+// Correction (2026-10-24): gemini-2.5-flash is closed to NEW AI Studio keys
+// and returns 404 for them (proven live: the site showed gemini_404).
+// The proxy now walks a model list per request and uses the first model
+// Google serves to this key — a future model retirement degrades to the
+// next entry instead of killing the service.
+//
 // Env vars required in Vercel project settings:
 //   GEMINI_API_KEY   — the AI Studio key (secret)
 //   FIREBASE_API_KEY — the site's public Firebase web apiKey (already public)
 
-const GEMINI_MODEL = "gemini-2.5-flash";
-const TTS_MODEL = "gemini-2.5-flash-preview-tts";
+const ANSWER_MODELS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash"];
+const TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"];
 const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || "AIzaSyBSIsS5uk6wEu3nd7rimi8Pwu3Naw_nL2Q";
 
 const SYSTEM_NAHW = `You are the answer engine inside «ماہر النحو», a website devoted EXCLUSIVELY to Arabic grammar (فن النحو). Rules:
@@ -20,6 +26,7 @@ const SYSTEM_NAHW = `You are the answer engine inside «ماہر النحو», a
 5. Reply in the language named in the request (Urdu / Sindhi / Arabic), keeping Arabic grammatical terms in Arabic script. Structure the answer with short headings and line breaks so it can be read aloud sentence by sentence.`;
 
 async function verifyCaller(idToken) {
+  // Verify Firebase ID token -> email, via Identity Toolkit (no SDK needed).
   const r = await fetch(`https://www.googleapis.com/identitytoolkit/v3/relyingparty/getAccountInfo?key=${FIREBASE_API_KEY}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -29,7 +36,10 @@ async function verifyCaller(idToken) {
   const data = await r.json();
   const email = data.users && data.users[0] && data.users[0].email;
   if (!email) return null;
+  // Admin first: the admin has no users/{email} doc by design, so this check
+  // must precede the Firestore doc read or the admin locks himself out.
   if (email.toLowerCase() === "ashrafahmadani953@gmail.com") return email;
+  // Allowlist + active check: read users/{email} in Firestore with the same token.
   const projectId = "mahirunnahw";
   const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${encodeURIComponent(email.toLowerCase())}`;
   const d = await fetch(docUrl, { headers: { Authorization: `Bearer ${idToken}` } });
@@ -39,25 +49,37 @@ async function verifyCaller(idToken) {
   return active ? email : null;
 }
 
-async function geminiAnswer(question, langName, contextText, kind) {
+// POST generateContent to the first model in `models` that Google serves to
+// this key. A 404 means "model not open to this key" — walk to the next one.
+// Any other HTTP error aborts immediately with its status in the message.
+async function geminiCall(models, body) {
   const key = process.env.GEMINI_API_KEY;
+  let lastErr = null;
+  for (const model of models) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (r.ok) return { model, data: await r.json() };
+    if (r.status === 404) { lastErr = new Error("gemini_404"); continue; }
+    throw new Error("gemini_" + r.status);
+  }
+  throw lastErr || new Error("gemini_404");
+}
+
+async function geminiAnswer(question, langName, contextText, kind) {
   let userText = `Reply language: ${langName}.\nStudent question: ${question}` +
     (contextText ? `\nRelevant text from the app's own library (Quran/hadith wording supplied verbatim):\n${contextText}` : "");
   if (kind === "tarkeeb") {
     userText += `\n\nOUTPUT FORMAT (mandatory): reply with ONLY a JSON object, no markdown fences, no extra text:
 {"passage": "<the complete Arabic passage/ayah exactly as supplied>", "translation": "<a faithful translation of the passage into ${langName}>", "mujmal": "<concise sentence-level tarkeeb (مجمل) in ${langName}, Arabic terms in Arabic script>", "mufassal": "<full word-by-word tarkeeb (مفصل): every word — its kind, i'rab or bina', its function; for every مبنی word state مبنی اصل or مبنی غیر اصل with the reason; list all valid ihtimalat where they exist — in ${langName}, Arabic terms in Arabic script>"}`;
   }
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_NAHW }] },
-      contents: [{ role: "user", parts: [{ text: userText }] }],
-      generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
-    }),
+  const { data } = await geminiCall(ANSWER_MODELS, {
+    systemInstruction: { parts: [{ text: SYSTEM_NAHW }] },
+    contents: [{ role: "user", parts: [{ text: userText }] }],
+    generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
   });
-  if (!r.ok) throw new Error("gemini_" + r.status);
-  const data = await r.json();
   const parts = data.candidates?.[0]?.content?.parts || [];
   const raw = parts.map(p => p.text || "").join("").trim();
   if (kind === "tarkeeb") {
@@ -65,7 +87,7 @@ async function geminiAnswer(question, langName, contextText, kind) {
       const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
       const obj = JSON.parse(cleaned);
       if (obj && obj.passage && obj.mujmal && obj.mufassal) return obj;
-    } catch (e) { }
+    } catch (e) { /* fall through to plain answer */ }
     return { answer: raw };
   }
   return { answer: raw };
@@ -82,20 +104,13 @@ function pcmToWavBase64(pcmBase64, sampleRate = 24000) {
 }
 
 async function geminiSpeak(text, voiceName) {
-  const key = process.env.GEMINI_API_KEY;
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL}:generateContent?key=${key}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text }] }],
-      generationConfig: {
-        responseModalities: ["AUDIO"],
-        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName || "Kore" } } },
-      },
-    }),
+  const { data } = await geminiCall(TTS_MODELS, {
+    contents: [{ role: "user", parts: [{ text }] }],
+    generationConfig: {
+      responseModalities: ["AUDIO"],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName || "Kore" } } },
+    },
   });
-  if (!r.ok) throw new Error("tts_" + r.status);
-  const data = await r.json();
   const inline = data.candidates?.[0]?.content?.parts?.[0]?.inlineData;
   if (!inline || !inline.data) throw new Error("tts_empty");
   return pcmToWavBase64(inline.data);
